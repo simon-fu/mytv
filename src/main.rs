@@ -1,4 +1,19 @@
 /* 
+    程序用途：
+    - 小米电视开机时，启动指定app
+
+    程序原理和用法：
+    - 小米电视本身有 http api 供外部调用；
+    - 本程序运行在和小米电视同一个局域网的另一台机器上；
+    - 程序通过 tcp connect 检测小米电视是否启动；
+    - 当小米电视没启动时，可通过接收组播包来触发检测，这是可选项，目的是为了节能（也许节能不多）
+    - 当小米电视启动时，每隔几秒钟 tcp connect 探测小米电视是否关机
+    - 运行程序例子： ./mytv --ip 192.168.1.10 --package org.xbmc.kodi --mcast 224.0.0.251:5353
+      其中 192.168.1.10 是小米电视 ip 地址， org.xbmc.kodi 是 app 包名， 224.0.0.251:5353 接收组播地址（可选）
+    - 小米电视安装app，可以通过 当贝市场 的远程推送安装
+      即打开当贝市场，进入远程推送界面，界面上显示一个局域网http地址；
+      然后在电脑上用浏览器打开网址；
+
     小米电视启动app的方法
     - curl -v http://192.168.1.10:6095/controller?action=startapp&type=packagename&packagename=org.xbmc.kodi
     - ./adb shell am start org.xbmc.kodi/.Main
@@ -10,6 +25,11 @@
 
     参考：
     - https://www.cnblogs.com/zooqkl/p/12708690.html
+    - https://loliwa.com/124.html
+    - https://blog.csdn.net/ezconn/article/details/99885715
+    - https://miuiver.com/ad-blocking-on-mitv/
+    - https://juejin.cn/s/adb%E8%AE%BE%E7%BD%AE%E9%BB%98%E8%AE%A4%E5%90%AF%E5%8A%A8%E5%99%A8
+    - https://zhuanlan.zhihu.com/p/601543380
 */
 
 use std::{time::Duration, net::{IpAddr, SocketAddr}};
@@ -212,7 +232,7 @@ where
         }
     } else {
         EnvFilter::builder()
-        .with_default_directive(LevelFilter::DEBUG.into())
+        .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy()
     };
         
