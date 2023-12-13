@@ -19,4 +19,4 @@ time = {version = "=0.3.21", features = ["formatting", "macros"]}
 
 anyhow = "=1.0.71"
 # bytes = "=1.1.0"
-# socket2 = "=0.4.10"
+socket2 = "=0.4.10"

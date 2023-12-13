@@ -12,7 +12,7 @@
     - https://www.cnblogs.com/zooqkl/p/12708690.html
 */
 
-use std::time::Duration;
+use std::{time::Duration, net::{IpAddr, SocketAddr}};
 
 use anyhow::{Result, Context};
 use clap::Parser;
@@ -22,9 +22,9 @@ use tokio::time::Instant;
 use tracing::{level_filters::LevelFilter, debug, info, error};
 use tracing_subscriber::{EnvFilter, fmt::{time::OffsetTime, MakeWriter}};
 
-// use crate::multicast::bind_multicast;
+use crate::multicast::bind_multicast;
 
-// mod multicast;
+mod multicast;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,31 +34,54 @@ async fn main() -> Result<()> {
     // let timeout = Duration::from_secs(10);
     // let cmd_line = r#"curl -v http://192.168.1.10:6095/controller?action=startapp&type=packagename&packagename=org.xbmc.kodi"#;
 
-
-    // let tv_ip = "192.168.1.10";
-    // let package_name = "org.xbmc.kodi";
-    // let timeout: u64 = "3000".parse()?;
-
     let args = CmdArgs::parse();
-    let tv_ip = args.tv_ip.as_str();
+    let tv_ip: IpAddr = args.tv_ip.parse().with_context(||"invalid tv ip")?;
     let package_name = args.package_name.as_str();
-    let timeout = args.timeout;
+    let timeout = Duration::from_millis(args.timeout);
+
+    
+    if let Some(multicast_addr) = args.multicast_addr.as_ref() {
+        let _r = MulticastSocket::try_new(multicast_addr, None).await
+        .with_context(||"bind multicast socket failed")?;
+    }
 
     let tv_addr = format!("{tv_ip}:6095");
     let cmd_line = format!("curl -v http://{tv_addr}/controller?action=startapp&type=packagename&packagename={package_name}");
     let cmd_args: Vec<&str> = cmd_line.split(" ").collect();
 
-    let mut last_alive = tcp_connect(tv_addr.as_str(), Duration::from_millis(timeout)).await.is_ok();
-    info!("first state [{last_alive}]");
+    let tcp_prober = TcpProber::new(tv_addr, timeout);
+
+    let last_alive = tcp_prober.probe().await;
+    info!("tv init state [{last_alive}]");
 
     loop {
-        // probe_tv_switch_on_mcast(expect_ip, timeout).await?;
-        probe_tv_switch_on_tcp(tv_addr.as_str(), Duration::from_millis(timeout), &mut last_alive).await?;
+        tcp_prober.probe_until_off().await?;
+        info!("tv switch off");
+
+        if let Some(multicast_addr) = args.multicast_addr.as_ref() {
+
+            let socket = MulticastSocket::try_new(multicast_addr, None).await
+            .with_context(||"bind multicast socket failed")?;
+            let mut buf = vec![0;  1700];
+
+            while !tcp_prober.probe().await {
+                let (len, from) = socket.recv_peer(tv_ip, &mut buf).await?;
+                debug!("recv tv multicast from [{from}], bytes {len}");
+            }
+            info!("mulitcast: tv switch on");
+        } else {
+            debug!("tcp: try probing until tv on");
+            tcp_prober.probe_until_on().await?;
+            info!("tcp: tv switch on");
+        }
+
+        
+        debug!("executing cmd [{cmd_line}]");
         exec_command(&cmd_args).await?;
     }
 }
 
-async fn exec_command(cmd_args: &[&str]) -> Result<()> {
+async fn exec_command(cmd_args: &[&str]) -> Result<bool> {
     let mut command = tokio::process::Command::new(cmd_args[0]);
     for n in 1..cmd_args.len() {
         command.arg(cmd_args[n]);
@@ -72,42 +95,96 @@ async fn exec_command(cmd_args: &[&str]) -> Result<()> {
         let stdout = std::str::from_utf8(&output.stdout);
         let stderr = std::str::from_utf8(&output.stderr);
         error!("exec commnad failed, code [{code:?}], stdout [{stdout:?}], stderr [{stderr:?}]");
+        Ok(false)
+    } else {
+        info!("exec cmd ok");
+        Ok(true)
     }
-
-    info!("exec cmd ok");
-
-    Ok(())
 }
 
-async fn probe_tv_switch_on_tcp(addr: &str, timeout: Duration, last_alive: &mut bool) -> Result<()> {
 
-    loop {
-        let kick_time = Instant::now();
 
-        let alive = tcp_connect(addr, timeout).await.is_ok();
-        debug!("next state [{last_alive}] -> [{alive}]");
+#[derive(Debug)]
+pub struct TcpProber {
+    addr: String,
+    timeout: Duration,
+}
 
-        if alive != *last_alive {
-            info!("state changed [{last_alive}] -> [{alive}]");
-            let is_on = !*last_alive;
-            *last_alive = alive;
+impl TcpProber {
+    pub fn new(addr: String, timeout: Duration) -> Self {
+        Self {
+            addr,
+            timeout,
+        }
+    }
 
-            if is_on {
+    pub async fn probe_until_on(&self) -> Result<()> {
+        self.probe_until(true).await
+    }
+
+    pub async fn probe_until_off(&self) -> Result<()> {
+        self.probe_until(false).await
+    }
+
+    pub async fn probe(&self) -> bool {
+        let is_on = self.try_connect().await.is_ok();
+        debug!("probe state [{is_on}]");
+        is_on
+    }
+
+    async fn probe_until(&self, expect: bool) -> Result<()> {
+        loop {
+            let kick_time = Instant::now();
+    
+            let alive = self.probe().await;
+    
+            if alive == expect {
                 return Ok(())
             }
-        }
-        
-
-        let elapsed = kick_time.elapsed();
-        if elapsed < timeout {
-            tokio::time::sleep(timeout - elapsed).await;
+            
+            let elapsed = kick_time.elapsed();
+            if elapsed < self.timeout {
+                tokio::time::sleep(self.timeout - elapsed).await;
+            }
         }
     }
+
+    async fn try_connect(&self) -> Result<()> {
+        let _r = tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&self.addr)).await??;
+        Ok(())
+    }
+
 }
 
-async fn tcp_connect(addr: &str, timeout: Duration) -> Result<()> {
-    let _r = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await??;
-    Ok(())
+#[derive(Debug)]
+pub struct MulticastSocket {
+    socket: tokio::net::UdpSocket,
+    // buf: Vec<u8>,
+}
+
+impl MulticastSocket {
+    pub async fn try_new(
+        multi_addr: &str,
+        if_addr: Option<&str>,
+    ) -> Result<Self> {
+        let std_socket = bind_multicast(multi_addr, if_addr)?;
+        std_socket.set_nonblocking(true)?;
+        let socket = tokio::net::UdpSocket::from_std(std_socket)?;
+
+        Ok(Self {
+            socket,
+            // buf: vec![0; 1700],
+        })
+    }
+
+    pub async fn recv_peer<'a>(&self, expect_ip: IpAddr, buf: &'a mut [u8]) -> Result<(usize, SocketAddr)> {
+        loop {
+            let (len, from) = self.socket.recv_from(buf).await?;
+            if from.ip() == expect_ip {
+                return Ok((len, from) )
+            }
+        }
+    }
 }
 
 
@@ -157,6 +234,9 @@ pub struct CmdArgs {
 
     #[clap(long="package", long_help = "app package name, for example org.xbmc.kodi")]
     package_name: String,
+
+    #[clap(long="mcast", long_help = "optional multicast address for saving electricity, for example 224.0.0.251:5353")]
+    multicast_addr: Option<String>,
 
     #[clap(long="timeout", long_help = "timeout in milliseconds", default_value="3000")]
     timeout: u64,
